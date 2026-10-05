@@ -398,6 +398,101 @@ def test_mixed_sign_sum_pool_reduction_count_star():
     assert len(pool.reduced) == 13
 
 
+def test_mixed_sign_sum_pool_selfjoin_shared_zero_label():
+    """Dependency-aware reduction for a join-fed aggregate: an active
+    member (5 or -5) can share source labels with an inert (zero) member.
+    The zero member's label (t[4]) must be kept, because deleting the
+    shared label t[1] plus t[4] empties the group. A fully inert label
+    that no member depends on (t[5], filtered out) never enters the pool.
+    """
+    tables = [
+        {
+            "table": "t",
+            "primary_key": ["id"],
+            "columns": ["id", "lk", "rk", "amount"],
+            "rows": [
+                {"id": 1, "lk": 1, "rk": None, "amount": 0},
+                {"id": 2, "lk": None, "rk": 1, "amount": 5},
+                {"id": 3, "lk": None, "rk": 1, "amount": -5},
+                {"id": 4, "lk": 2, "rk": 2, "amount": 0},
+                {"id": 5, "lk": 3, "rk": 3, "amount": 100},
+            ],
+        }
+    ]
+    plan = {
+        "type": "aggregate",
+        "input": {
+            "type": "filter",
+            "predicate": {
+                "or": [
+                    {"column": "right.id", "op": "=", "value": 2},
+                    {"column": "right.id", "op": "=", "value": 3},
+                    {"column": "right.id", "op": "=", "value": 4},
+                ]
+            },
+            "input": {
+                "type": "join",
+                "left": {"type": "scan", "table": "t"},
+                "right": {"type": "scan", "table": "t"},
+                "on": [{"left": "lk", "right": "rk"}],
+            },
+        },
+        "aggregates": [{"fn": "sum", "column": "right.amount", "as": "total"}],
+    }
+    ev = make_evaluator(tables)
+    pool = ev.mixed_sign_sum_pool(plan, (0,))
+    assert pool is not None
+    # Three join members survive the filter; two are active (5, -5).
+    assert pool.group_member_count == 3
+    assert pool.active_member_count == 2
+    # Labels of all three members, including the zero self-join.
+    assert pool.full == {L("t", 1), L("t", 2), L("t", 3), L("t", 4)}
+    # The zero member's label t[4] is retained (shared-label core {t[1]}).
+    assert pool.reduced == {L("t", 1), L("t", 2), L("t", 3), L("t", 4)}
+    assert pool.dropped_inert_count == 0
+
+
+def test_mixed_sign_sum_pool_one_to_one_zeros_reduced():
+    """One-to-one (disjoint-witness) zero members stay droppable even for
+    a join-fed mixed-sign sum: 22 source labels reduce to the four
+    non-zero labels, so the padded case never trips the pool cap."""
+    rows = [
+        {"id": 1, "lk": 1, "rk": None, "amount": 0},
+        {"id": 2, "lk": 2, "rk": None, "amount": 0},
+        {"id": 3, "lk": None, "rk": 1, "amount": 5},
+        {"id": 4, "lk": None, "rk": 2, "amount": -5},
+    ]
+    for i in range(3, 12):
+        rows.append({"id": i + 2, "lk": i, "rk": None, "amount": 0})
+        rows.append({"id": i + 11, "lk": None, "rk": i, "amount": 0})
+    tables = [
+        {
+            "table": "t",
+            "primary_key": ["id"],
+            "columns": ["id", "lk", "rk", "amount"],
+            "rows": rows,
+        }
+    ]
+    plan = {
+        "type": "aggregate",
+        "input": {
+            "type": "join",
+            "left": {"type": "scan", "table": "t"},
+            "right": {"type": "scan", "table": "t"},
+            "on": [{"left": "lk", "right": "rk"}],
+        },
+        "aggregates": [{"fn": "sum", "column": "right.amount", "as": "total"}],
+    }
+    ev = make_evaluator(tables)
+    pool = ev.mixed_sign_sum_pool(plan, (0,))
+    assert pool is not None
+    assert pool.group_member_count == 11
+    assert pool.active_member_count == 2
+    assert pool.reduced == {L("t", 1), L("t", 2), L("t", 3), L("t", 4)}
+    assert len(pool.full) == 22
+    assert pool.dropped_inert_count == 18
+
+
 def test_empty_aggregate_input():
     from app.errors import ApiError
 

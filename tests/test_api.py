@@ -679,6 +679,159 @@ def test_counterfactual_recompute_empty_aggregate(client):
     assert sc["recompute_error"]["code"] == "EMPTY_AGGREGATE"
 
 
+def test_selfjoin_sum_zero_two_label_deletion_set(client):
+    """Regression (join sum counterfactual false negative): a self-join
+    filtered to three members — source row 1 joins row 2 (amount 5) and
+    row 3 (amount -5); row 4 self-joins to a zero-valued member — sums
+    to 0. Candidate reduction by member amount drops row 4, so only the
+    singletons {t[2]} and {t[3]} were reported and the two-label set
+    {t[1], t[4]} was missed. The zero-valued member's label must be kept
+    when an active-label core (here {t[1]}) is shared with the zero
+    member: deleting both removes every join member and empties the
+    aggregate (recompute_error EMPTY_AGGREGATE)."""
+    req = {
+        "idempotency_key": "key-selfjoin-mixed-zero",
+        "tables": [
+            {
+                "table": "t",
+                "primary_key": ["id"],
+                "columns": ["id", "lk", "rk", "amount"],
+                "rows": [
+                    {"id": 1, "lk": 1, "rk": None, "amount": 0},
+                    {"id": 2, "lk": None, "rk": 1, "amount": 5},
+                    {"id": 3, "lk": None, "rk": 1, "amount": -5},
+                    {"id": 4, "lk": 2, "rk": 2, "amount": 0},
+                    {"id": 5, "lk": 3, "rk": 3, "amount": 100},
+                ],
+            }
+        ],
+        "plan": {
+            "type": "aggregate",
+            "input": {
+                "type": "filter",
+                "predicate": {
+                    "or": [
+                        {"column": "right.id", "op": "=", "value": 2},
+                        {"column": "right.id", "op": "=", "value": 3},
+                        {"column": "right.id", "op": "=", "value": 4},
+                    ]
+                },
+                "input": {
+                    "type": "join",
+                    "left": {"type": "scan", "table": "t"},
+                    "right": {"type": "scan", "table": "t"},
+                    "on": [{"left": "lk", "right": "rk"}],
+                },
+            },
+            "aggregates": [
+                {"fn": "sum", "column": "right.amount", "as": "total"}
+            ],
+        },
+        "explain": {"row": {"total": 0}},
+    }
+    r1 = client.post("/query", json=req)
+    assert r1.status_code == 200, r1.text
+    body = r1.json()
+    # The target sum=0 is witnessed both by the zero-valued self-join
+    # member (t[4]) and by the 5 + -5 cancellation (t[1],t[2],t[3]).
+    target = body["result"]["rows"][0]
+    assert target["row"] == {"total": 0}
+    assert target["minimal_witnesses"][0]["labels"] == ["t[1]", "t[2]", "t[3]"]
+    assert target["minimal_witnesses"][1]["labels"] == ["t[4]"]
+    assert body["symbol_table"] == [
+        {"source": "t[1]", "symbol": "s1"},
+        {"source": "t[2]", "symbol": "s2"},
+        {"source": "t[3]", "symbol": "s3"},
+        {"source": "t[4]", "symbol": "s4"},
+    ]
+    cf = body["counterfactual"]
+    assert cf["minimal_deletion_count"] == 3
+    assert cf["minimal_deletion_sets"] == [
+        ["t[1]", "t[4]"],
+        ["t[2]"],
+        ["t[3]"],
+    ]
+    by_delete = {tuple(sc["delete"]): sc for sc in cf["scenarios"]}
+    # The two singletons leave the one surviving member: totals -5 and 5.
+    assert by_delete[("t[2]",)]["target_present"] is False
+    assert by_delete[("t[2]",)]["result"]["rows"] == [{"total": -5}]
+    assert by_delete[("t[3]",)]["target_present"] is False
+    assert by_delete[("t[3]",)]["result"]["rows"] == [{"total": 5}]
+    # The two-label set removes all three members: the aggregate input
+    # becomes empty, so the scenario keeps the EMPTY_AGGREGATE error.
+    pair = by_delete[("t[1]", "t[4]")]
+    assert pair["target_present"] is False
+    assert "result" not in pair
+    assert pair["recompute_error"]["code"] == "EMPTY_AGGREGATE"
+    # Idempotent replay stays byte-identical (success path).
+    r2 = client.post("/query", json=req)
+    assert r2.status_code == 200
+    assert r1.content == r2.content
+    assert r2.headers["x-idempotent-replay"] == "true"
+
+
+def test_selfjoin_one_to_one_zero_padding_four_singletons(client):
+    """The dependency-aware reduction must not let the candidate pool
+    explode: an equi-join with one-to-one members carrying amounts
+    5, -5 and nine 0s (22 source labels) still reduces to the four
+    non-zero labels and returns exactly four singleton deletion sets —
+    no false COUNTERFACTUAL_SEARCH_BUDGET_EXCEEDED."""
+    rows = [
+        {"id": 1, "lk": 1, "rk": None, "amount": 0},
+        {"id": 2, "lk": 2, "rk": None, "amount": 0},
+        {"id": 3, "lk": None, "rk": 1, "amount": 5},
+        {"id": 4, "lk": None, "rk": 2, "amount": -5},
+    ]
+    for i in range(3, 12):  # nine zero-only 1:1 join pairs, ids 5..22
+        rows.append({"id": i + 2, "lk": i, "rk": None, "amount": 0})
+        rows.append({"id": i + 11, "lk": None, "rk": i, "amount": 0})
+    req = {
+        "idempotency_key": "key-selfjoin-onetoone-zeros",
+        "tables": [
+            {
+                "table": "t",
+                "primary_key": ["id"],
+                "columns": ["id", "lk", "rk", "amount"],
+                "rows": rows,
+            }
+        ],
+        "plan": {
+            "type": "aggregate",
+            "input": {
+                "type": "join",
+                "left": {"type": "scan", "table": "t"},
+                "right": {"type": "scan", "table": "t"},
+                "on": [{"left": "lk", "right": "rk"}],
+            },
+            "aggregates": [
+                {"fn": "sum", "column": "right.amount", "as": "total"}
+            ],
+        },
+        "explain": {"row": {"total": 0}},
+    }
+    r1 = client.post("/query", json=req)
+    assert r1.status_code == 200, r1.text
+    cf = r1.json()["counterfactual"]
+    assert cf["minimal_deletion_count"] == 4
+    assert cf["minimal_deletion_sets"] == [
+        ["t[1]"],
+        ["t[2]"],
+        ["t[3]"],
+        ["t[4]"],
+    ]
+    by_delete = {tuple(sc["delete"]): sc for sc in cf["scenarios"]}
+    assert by_delete[("t[1]",)]["result"]["rows"] == [{"total": -5}]
+    assert by_delete[("t[2]",)]["result"]["rows"] == [{"total": 5}]
+    assert by_delete[("t[3]",)]["result"]["rows"] == [{"total": -5}]
+    assert by_delete[("t[4]",)]["result"]["rows"] == [{"total": 5}]
+    for sc in cf["scenarios"]:
+        assert sc["target_present"] is False
+        assert "recompute_error" not in sc
+    r2 = client.post("/query", json=req)
+    assert r1.content == r2.content
+    assert r2.headers["x-idempotent-replay"] == "true"
+
+
 def test_error_response_is_canonical_and_cached(client):
     req = {
         "idempotency_key": "key-err-cached",

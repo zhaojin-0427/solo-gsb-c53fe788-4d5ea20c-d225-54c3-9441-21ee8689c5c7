@@ -600,15 +600,19 @@ class Evaluator:
         *node* is the plan root and *target_data* the target row aligned to
         its output schema. The walk descends through ``filter``/``project``
         nodes (which neither change row identity nor dependencies) to the
-        innermost ``aggregate`` producing the target. Returns ``None`` when:
+        innermost ``aggregate`` producing the target; the aggregate's input
+        may itself be any plan subtree (scan, join, filter, project ...) —
+        member witnesses then carry whatever source labels the subtree
+        requires (e.g. a self-join member can be supported by several
+        source rows). Returns ``None`` when:
 
         * no ``sum`` aggregate is involved (count/min/max are exact through
           hitting sets), or
         * the target group's sum values are all non-negative or all
           non-positive (the sum then changes iff a minimal-combination row is
           deleted, so hitting sets stay exact), or
-        * the aggregate cannot be reached by the walk (e.g. a join above
-          it), in which case the caller keeps the hitting-set answer.
+        * the aggregate cannot be reached by the walk (a join *above* it),
+          in which case the caller keeps the hitting-set answer.
 
         Candidate reduction
         -------------------
@@ -626,12 +630,43 @@ class Evaluator:
           extremum — removing it cannot move the extremum.
 
         A member is *active* when it is non-inert for at least one aggregate.
-        The reduced pool is the union of the active members' witness labels
-        (any label supporting only inert members is dropped). Every minimal
-        deletion set of the full pool is contained in the reduced pool:
-        deleting inert members alone leaves every target aggregate value
-        untouched and the group key fixed, and an inert member added to a
-        killing set is removable without restoring the target row.
+        The active members' witness labels (``P``) always stay in the pool.
+
+        Dependency-sensitive inert labels
+        ---------------------------------
+        An *inert* member leaves every target aggregate value untouched
+        *while every active member stays classified the same way*, so inert
+        labels are normally dropped. There is one exception: an active
+        member and an inert member can share source labels (typical when the
+        aggregate input is a join — e.g. a zero-valued self-join member can
+        carry a label also needed by a non-zero member). Deleting such a
+        shared label removes both: the zero member vanishes while the
+        non-zero members' group shrinks. A set ``A`` of active-pool labels
+        that kills **every** active member is a *dangerous core* when:
+
+        1. ``A`` is an inclusion-minimal hitting set of the active members'
+           witness families (removing any label of ``A`` leaves some active
+           member alive — required for ``A`` to occur in a minimal set);
+        2. after deleting ``A``, the surviving inert members reproduce the
+           target row (the inert residue still has the target values and
+           the group key — otherwise ``A`` alone already kills the target);
+        3. for each label ``a ∈ A``, deleting ``A ∖ {a}`` leaves the target
+           alive (otherwise ``A`` alone would be a smaller killing set).
+
+        When such a core exists, the surviving inert members can only be
+        removed through their own labels, so the labels of those survivors'
+        witnesses (restricted to labels outside the active pool) are added
+        back to the reduced pool. The exact enumeration then finds sets like
+        ``A ∪ {zero-label}`` (in the self-join case: the pair deleting a
+        shared side and the zero-valued self-join, whose recomputation
+        empties the aggregate input). With one-to-one (disjoint-witness)
+        members every inert survivor is independently killable and no
+        dangerous core survives condition 3, so arbitrary many padding
+        zero rows are still reduced away completely.
+
+        Every inclusion-minimal deletion set is contained in the reduced
+        pool; any label dropped here can be removed from a killing set
+        without restoring the target (see the cases analysed above).
         """
         data = tuple(target_data)
         while True:
@@ -708,14 +743,122 @@ class Evaluator:
                         active[i] = True
 
         full_pool: set[Label] = set()
-        reduced_pool: set[Label] = set()
+        for i, r in enumerate(members):
+            for w in r["witnesses"]:
+                full_pool.update(w)
+
+        active_pool: set[Label] = set()
+        active_members: list[dict] = []
+        inert_members: list[dict] = []
         for i, r in enumerate(members):
             member_labels: set[Label] = set()
             for w in r["witnesses"]:
                 member_labels.update(w)
-            full_pool.update(member_labels)
             if active[i]:
-                reduced_pool.update(member_labels)
+                active_members.append(r)
+                active_pool.update(member_labels)
+            else:
+                inert_members.append(r)
+
+        def survives_deleted(r: dict, deleted: set[Label]) -> bool:
+            """An input member survives iff at least one witness survives:
+            a conjunctive witness is intact only when none of its labels
+            has been deleted."""
+            return any(w.isdisjoint(deleted) for w in r["witnesses"])
+
+        col_index = {
+            col: in_names.index(col)
+            for fn, col, _ in aggs
+            if not (fn == "count" and col in (None, "*"))
+        }
+
+        def agg_value(fn: str, col: str | None, survivors: list[dict]) -> Any:
+            """Value of one aggregate over *survivors* — values only, no
+            witness enumeration (the expensive minimal-combination search
+            is irrelevant for residue checks, which compare numbers)."""
+            if fn == "count":
+                if col is None or col == "*":
+                    return len(survivors)
+                ci = col_index[col]
+                return sum(1 for m in survivors if m["data"][ci] is not None)
+            ci = col_index[col]
+            vals = [m["data"][ci] for m in survivors if m["data"][ci] is not None]
+            if not vals:
+                return None
+            if fn == "sum":
+                total = vals[0]
+                for v in vals[1:]:
+                    total += v
+                return total
+            return min(vals) if fn == "min" else max(vals)
+
+        def residue_matches_target(survivors: list[dict]) -> bool:
+            """Whether survivors still form the target group: the group must
+            be non-empty (its key is unchanged — all members share it) and
+            every aggregate must still yield the target value."""
+            if not survivors:
+                return False
+            for fn, col, asname in aggs:
+                if agg_value(fn, col, survivors) != values[asname]:
+                    return False
+            return True
+
+        # Inert labels can be dropped unless a *dangerous core* of active
+        # labels exists: deleting the core kills every active member while
+        # inert members survive and still reproduce the target row. Such a
+        # core alone does not kill the target (and, being inclusion-minimal,
+        # none of its strict subsets does), but it can be completed by
+        # deleting the inert survivors' own labels. See the method docstring.
+        from .provenance import MAX_RECOMPUTE_POOL, minimal_hitting_sets
+
+        if len(active_pool) > MAX_RECOMPUTE_POOL:
+            # The exact search is already doomed by the pool cap (adding
+            # inert labels can only grow the pool); skip the core analysis
+            # and let the search raise its structured budget error.
+            needed_inert: set[Label] = set()
+        else:
+            needed_inert = set()
+            # "D kills every active member" iff D hits every minimal
+            # witness of every active member — i.e. D is a transversal of
+            # the flat union of their witness families. Superset/duplicate
+            # edges are redundant for transversals, so this avoids the
+            # cartesian choice product (cover_witnesses) outright.
+            active_edges: set[Witness] = set()
+            for m in active_members:
+                active_edges.update(m["witnesses"])
+            for core in minimal_hitting_sets(active_edges):
+                core_set = set(core)
+                # condition 1: the core kills every active member
+                if any(survives_deleted(m, core_set) for m in active_members):
+                    continue
+                inert_survivors = [
+                    m for m in inert_members if survives_deleted(m, core_set)
+                ]
+                # condition 2: the inert residue must still hold the target
+                if not residue_matches_target(inert_survivors):
+                    continue
+                # condition 3: removing any single core label must leave the
+                # target alive (otherwise the core alone or a strict subset
+                # is already a smaller killing set).
+                minimal_core = True
+                for a in core_set:
+                    smaller = core_set - {a}
+                    survivors = [
+                        m for m in members if survives_deleted(m, smaller)
+                    ]
+                    if not residue_matches_target(survivors):
+                        minimal_core = False
+                        break
+                if not minimal_core:
+                    continue
+                # Labels of the surviving inert members complete the core;
+                # active-pool labels are part of the core anyway.
+                for m in inert_survivors:
+                    for w in m["witnesses"]:
+                        needed_inert.update(w)
+
+        needed_inert -= active_pool
+        reduced_pool = active_pool | needed_inert
 
         # Defensive: an empty reduced pool would mean no singleton pool at
         # all, but a mixed-sign sum guarantees non-zero members exist; leave
