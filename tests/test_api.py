@@ -583,6 +583,168 @@ def test_sum_mixed_signs_zero_rows_active_under_count(client):
     assert zero_case["result"]["rows"] == [{"n": 12, "total": 5}]
 
 
+def test_self_join_sum_counterfactual_includes_zero_self_pair(client):
+    """Regression: same-table self-join filtered to three members.
+
+    Row 1 joins row 2 (amount 5) and row 3 (amount -5); row 4 joins itself
+    (amount 0). The total is 0. Deleting rows 2 or 3 alone moves the total to
+    -5 / +5, but deleting row 1 alone removes BOTH the +5 and -5 pairs (net
+    zero) while the row4/row4 zero pair survives — so {ledger[1]} is not a
+    solution; the minimal two-label set {ledger[1], ledger[4]} empties the
+    aggregate input (EMPTY_AGGREGATE). The member-value candidate reduction
+    must not drop the zero pair's label simply because its value is zero; the
+    label-dependency gate widens the pool and the full-plan recomputation
+    search returns all three minimal deletion sets.
+    """
+    req = {
+        "idempotency_key": "key-selfjoin-mixed-zero",
+        "tables": [
+            {
+                "table": "ledger",
+                "primary_key": ["id"],
+                "columns": [
+                    {"name": "id", "type": "int"},
+                    {"name": "k", "type": "int"},
+                    {"name": "amount", "type": "int"},
+                ],
+                "rows": [
+                    {"id": 1, "k": 1, "amount": 0},
+                    {"id": 2, "k": 1, "amount": 5},
+                    {"id": 3, "k": 1, "amount": -5},
+                    {"id": 4, "k": 2, "amount": 0},
+                ],
+            }
+        ],
+        "plan": {
+            "type": "aggregate",
+            "input": {
+                "type": "filter",
+                "predicate": {
+                    "or": [
+                        {
+                            "and": [
+                                {"column": "id", "op": "=", "value": 1},
+                                {"column": "right.id", "op": ">=", "value": 2},
+                            ]
+                        },
+                        {"column": "id", "op": "=", "value": 4},
+                    ]
+                },
+                "input": {
+                    "type": "join",
+                    "left": {"type": "scan", "table": "ledger"},
+                    "right": {"type": "scan", "table": "ledger"},
+                    "on": [{"left": "k", "right": "k"}],
+                },
+            },
+            "aggregates": [{"fn": "sum", "column": "right.amount", "as": "total"}],
+        },
+        "explain": {"row": {"total": 0}},
+    }
+    r1 = client.post("/query", json=req)
+    assert r1.status_code == 200, r1.text
+    body = r1.json()
+    target = body["result"]["rows"][0]
+    assert target["row"] == {"total": 0}
+    # Witnesses: the non-empty zero combination over members
+    # {(1,2),(1,3)} -> labels {1,2,3}, and the zero self-pair {4}.
+    assert target["provenance"]["labels_structured"] == [
+        ["ledger[1]", "ledger[2]", "ledger[3]"],
+        ["ledger[4]"],
+    ]
+    cf = body["counterfactual"]
+    assert cf["minimal_deletion_count"] == 3
+    # Ordered by the stable label-tuple key: the two-label set comes first.
+    assert cf["minimal_deletion_sets"] == [
+        ["ledger[1]", "ledger[4]"],
+        ["ledger[2]"],
+        ["ledger[3]"],
+    ]
+    by_delete = {tuple(sc["delete"]): sc for sc in cf["scenarios"]}
+    # The two active singletons are recomputed whole-plan.
+    assert by_delete[("ledger[2]",)]["result"]["rows"] == [{"total": -5}]
+    assert by_delete[("ledger[3]",)]["result"]["rows"] == [{"total": 5}]
+    assert by_delete[("ledger[2]",)]["target_present"] is False
+    assert by_delete[("ledger[3]",)]["target_present"] is False
+    # Deleting row 1 alone leaves the zero self-pair: the target survives,
+    # which is exactly why this singleton is not a deletion set.
+    # The two-label set removes every join member: scalar aggregate input is
+    # empty, so the scenario keeps the structured EMPTY_AGGREGATE error.
+    both = by_delete[("ledger[1]", "ledger[4]")]
+    assert both["target_present"] is False
+    assert both["recompute_error"]["code"] == "EMPTY_AGGREGATE"
+    assert "result" not in both
+    # Idempotent replay stays byte-identical.
+    r2 = client.post("/query", json=req)
+    assert r2.status_code == 200
+    assert r1.content == r2.content
+    assert r2.headers["x-idempotent-replay"] == "true"
+
+
+def test_one_to_one_join_zero_padding_does_not_inflate_pool(client):
+    """5, -5 and nine 0s over a one-to-one inner join: the zero pairs are
+    reduced out of the candidate pool (each active-label singleton already
+    kills the target), so the answer is exactly the four single-label sets —
+    no spurious COUNTERFACTUAL_SEARCH_BUDGET_EXCEEDED from pool inflation."""
+    rows = [
+        {"oid": 1, "cid": 1, "amount": 5},
+        {"oid": 2, "cid": 2, "amount": -5},
+    ]
+    rows += [{"oid": i, "cid": i, "amount": 0} for i in range(3, 12)]
+    req = {
+        "idempotency_key": "key-join-1to1-padded",
+        "tables": [
+            {
+                "table": "orders",
+                "primary_key": ["oid"],
+                "columns": [
+                    {"name": "oid", "type": "int"},
+                    {"name": "cid", "type": "int"},
+                    {"name": "amount", "type": "int"},
+                ],
+                "rows": rows,
+            },
+            {
+                "table": "customers",
+                "primary_key": ["id"],
+                "columns": [
+                    {"name": "id", "type": "int"},
+                    {"name": "name", "type": "string"},
+                ],
+                "rows": [{"id": i, "name": f"c{i}"} for i in range(1, 12)],
+            },
+        ],
+        "plan": {
+            "type": "aggregate",
+            "input": {
+                "type": "join",
+                "left": {"type": "scan", "table": "orders"},
+                "right": {"type": "scan", "table": "customers"},
+                "on": [{"left": "cid", "right": "id"}],
+            },
+            "aggregates": [{"fn": "sum", "column": "amount", "as": "total"}],
+        },
+        "explain": {"row": {"total": 0}},
+    }
+    r = client.post("/query", json=req)
+    assert r.status_code == 200, r.text
+    cf = r.json()["counterfactual"]
+    assert cf["minimal_deletion_count"] == 4
+    assert cf["minimal_deletion_sets"] == [
+        ["customers[1]"],
+        ["customers[2]"],
+        ["orders[1]"],
+        ["orders[2]"],
+    ]
+    for sc in cf["scenarios"]:
+        assert sc["target_present"] is False
+    by_delete = {tuple(sc["delete"]): sc for sc in cf["scenarios"]}
+    assert by_delete[("orders[1]",)]["result"]["rows"] == [{"total": -5}]
+    assert by_delete[("orders[2]",)]["result"]["rows"] == [{"total": 5}]
+    assert by_delete[("customers[1]",)]["result"]["rows"] == [{"total": -5}]
+    assert by_delete[("customers[2]",)]["result"]["rows"] == [{"total": 5}]
+
+
 def test_counterfactual_search_budget_exceeded_structured(client):
     """A reduced candidate pool over the cap yields a structured 422 — never
     a successful response containing the hitting-set approximation — and the

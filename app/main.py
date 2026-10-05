@@ -19,6 +19,7 @@ from .provenance import (
     minimal_deletion_sets_by_recompute,
     minimal_hitting_sets,
     present_row,
+    refine_reduced_pool,
 )
 from .store import IdempotencyStore
 
@@ -220,21 +221,28 @@ def search_deletion_sets(
     pool: RecomputePool,
 ) -> list[frozenset[Label]]:
     """Run the exact recomputation search, converting budget exhaustion to
-    a structured 422 error carrying the pool statistics."""
-    try:
-        return minimal_deletion_sets_by_recompute(
-            pool.reduced,
-            lambda d: kills_target(payload.plan, tables, target_data, d),
-        )
-    except SearchBudgetExceeded as e:
+    a structured 422 error carrying the pool statistics.
+
+    The evaluator's candidate reduction is only proven exact for scans and
+    one-to-one joins; a label-dependency gate recomputes the plan once per
+    active-label singleton and widens the pool back to the full member-label
+    set when a singleton fails to kill the target (possible under joins:
+    one source label feeds several members whose value changes cancel, while
+    an inert zero-valued member keeps the target alive). Both the gate and
+    the exhaustive enumeration share the 10 000-recomputation budget.
+    """
+    from .provenance import MAX_RECOMPUTE_CALLS, MAX_RECOMPUTE_POOL
+
+    def budget_error(e: SearchBudgetExceeded, reduced_pool: set[Label], gate_calls: int):
         details = {
             "group_member_count": pool.group_member_count,
             "active_member_count": pool.active_member_count,
             "full_pool_size": len(pool.full),
-            "dropped_inert_label_count": pool.dropped_inert_count,
+            "dropped_inert_label_count": len(pool.full) - len(reduced_pool),
+            "dependency_gate_recomputes": gate_calls,
             **e.details,
         }
-        raise ApiError(
+        return ApiError(
             "COUNTERFACTUAL_SEARCH_BUDGET_EXCEEDED",
             "The exact counterfactual search for this non-monotone (mixed "
             "positive/negative) sum could not finish within the configured "
@@ -243,6 +251,54 @@ def search_deletion_sets(
             422,
             **details,
         )
+
+    def kills_fn(d: frozenset[Label]) -> bool:
+        return kills_target(payload.plan, tables, target_data, d)
+
+    # The provisional (active-only) pool must fit the enumeration cap before
+    # any recomputation is spent on the dependency gate.
+    if len(pool.reduced) > MAX_RECOMPUTE_POOL:
+        e = SearchBudgetExceeded(
+            "pool_too_large",
+            reduced_pool_size=len(pool.reduced),
+            pool_limit=MAX_RECOMPUTE_POOL,
+        )
+        raise budget_error(e, pool.reduced, 0)
+
+    try:
+        reduced_pool, outcomes, gate_calls = refine_reduced_pool(
+            pool.reduced,
+            pool.active_labels,
+            pool.full,
+            kills_fn,
+            max_calls=MAX_RECOMPUTE_CALLS,
+        )
+    except SearchBudgetExceeded as e:
+        raise budget_error(e, pool.reduced, e.details.get("recompute_calls", 0))
+
+    # A failed gate widens the pool back to the full member-label set, which
+    # itself must fit the enumeration cap.
+    if len(reduced_pool) > MAX_RECOMPUTE_POOL:
+        e = SearchBudgetExceeded(
+            "pool_too_large",
+            reduced_pool_size=len(reduced_pool),
+            pool_limit=MAX_RECOMPUTE_POOL,
+        )
+        raise budget_error(e, reduced_pool, gate_calls)
+
+    try:
+        return minimal_deletion_sets_by_recompute(
+            reduced_pool,
+            kills_fn,
+            known=outcomes,
+            max_calls=MAX_RECOMPUTE_CALLS - gate_calls,
+        )
+    except SearchBudgetExceeded as e:
+        if e.reason == "recompute_budget":
+            e.details["recompute_calls"] = (
+                gate_calls + e.details.get("recompute_calls", 0)
+            )
+        raise budget_error(e, reduced_pool, gate_calls)
 
 
 def execute_query(payload: QueryIn) -> dict[str, Any]:

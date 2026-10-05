@@ -6,6 +6,7 @@ from app.provenance import (
     SearchBudgetExceeded,
     minimal_deletion_sets_by_recompute,
     minimal_hitting_sets,
+    refine_reduced_pool,
 )
 
 
@@ -100,6 +101,76 @@ def test_search_budget_recompute_calls():
         minimal_deletion_sets_by_recompute(big, lambda d: False, max_calls=5)
     assert exc.value.reason == "recompute_budget"
     assert exc.value.details["recompute_calls"] == 6
+
+
+def test_refine_pool_gate_passes_when_every_active_singleton_kills():
+    # One-to-one join style: each active label kills on its own, so the
+    # inert-only labels (the zero pairs) stay reduced out.
+    active = {L("t", 1), L("t", 2)}
+    full = active | {L("z", i) for i in range(9)}
+    pool, outcomes, calls = refine_reduced_pool(
+        active, active, full, lambda d: True
+    )
+    assert pool == active
+    assert calls == 2
+    assert outcomes == {
+        frozenset([L("t", 1)]): True,
+        frozenset([L("t", 2)]): True,
+    }
+
+
+def test_refine_pool_gate_widens_on_nonsingleton_label():
+    # Self-join style: label t1 alone does not kill (its +5/-5 members
+    # cancel); the gate must stop immediately and widen back to the full
+    # pool, preserving the inert zero-pair labels.
+    active = {L("t", 1), L("t", 2), L("t", 3)}
+    inert = {L("t", 4)}
+    full = active | inert
+
+    def kills(d):
+        # t1 removes both cancelling members -> not killing; t2/t3 do.
+        if d == frozenset([L("t", 1)]):
+            return False
+        return True
+
+    pool, outcomes, calls = refine_reduced_pool(active, active, full, kills)
+    assert pool == full
+    assert calls == 1
+    assert outcomes == {frozenset([L("t", 1)]): False}
+
+
+def test_refine_pool_recomputes_count_toward_budget():
+    active = {L("t", 1), L("t", 2)}
+    with pytest.raises(SearchBudgetExceeded) as exc:
+        refine_reduced_pool(active, active, active, lambda d: True, max_calls=1)
+    assert exc.value.reason == "recompute_budget"
+    # The first call fits the budget; the second (which would exceed it)
+    # raises — the same convention as minimal_deletion_sets_by_recompute.
+    assert exc.value.details["recompute_calls"] == 2
+
+
+def test_search_reuses_gate_outcomes():
+    # Outcomes handed in via `known` are not recomputed; only the remaining
+    # candidates consume the per-search call budget.
+    pool = {L("t", 1), L("t", 2)}
+    known = {
+        frozenset(): False,
+        frozenset([L("t", 1)]): True,
+        frozenset([L("t", 2)]): True,
+    }
+    sols = minimal_deletion_sets_by_recompute(
+        pool,
+        lambda d: (_ for _ in ()).throw(AssertionError("should use cache")),
+        max_calls=0,
+        known=known,
+    )
+    assert sols == [frozenset([L("t", 1)]), frozenset([L("t", 2)])]
+    # A cached False outcome is a genuine cache hit (not mistaken for absent).
+    sols = minimal_deletion_sets_by_recompute(
+        pool, lambda d: False, max_calls=5,
+        known={frozenset(): False, frozenset([L("t", 1)]): False},
+    )
+    assert sols == []
 
 
 def make_evaluator(spec):
@@ -396,6 +467,58 @@ def test_mixed_sign_sum_pool_reduction_count_star():
     assert pool is not None
     assert pool.active_member_count == 13
     assert len(pool.reduced) == 13
+
+
+def test_mixed_sign_sum_pool_self_join_keeps_zero_pair_in_full_pool():
+    """Self-join: the zero-valued row4/row4 member is inert by value, so the
+    provisional reduced pool excludes ledger[4] — but it must remain in the
+    full pool so the dependency gate can widen the search (label 1 alone
+    removes the +5 and -5 members together and does not kill)."""
+    tables = [
+        {
+            "table": "ledger",
+            "primary_key": ["id"],
+            "columns": ["id", "k", "amount"],
+            "rows": [
+                {"id": 1, "k": 1, "amount": 0},
+                {"id": 2, "k": 1, "amount": 5},
+                {"id": 3, "k": 1, "amount": -5},
+                {"id": 4, "k": 2, "amount": 0},
+            ],
+        }
+    ]
+    plan = {
+        "type": "aggregate",
+        "input": {
+            "type": "filter",
+            "predicate": {
+                "or": [
+                    {
+                        "and": [
+                            {"column": "id", "op": "=", "value": 1},
+                            {"column": "right.id", "op": ">=", "value": 2},
+                        ]
+                    },
+                    {"column": "id", "op": "=", "value": 4},
+                ]
+            },
+            "input": {
+                "type": "join",
+                "left": {"type": "scan", "table": "ledger"},
+                "right": {"type": "scan", "table": "ledger"},
+                "on": [{"left": "k", "right": "k"}],
+            },
+        },
+        "aggregates": [{"fn": "sum", "column": "right.amount", "as": "total"}],
+    }
+    ev = make_evaluator(tables)
+    pool = ev.mixed_sign_sum_pool(plan, (0,))
+    assert pool is not None
+    assert pool.full == {L("ledger", 1), L("ledger", 2), L("ledger", 3), L("ledger", 4)}
+    assert pool.active_labels == {L("ledger", 1), L("ledger", 2), L("ledger", 3)}
+    assert pool.reduced == pool.active_labels
+    assert pool.group_member_count == 3
+    assert pool.active_member_count == 2
 
 
 def test_empty_aggregate_input():

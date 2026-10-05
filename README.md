@@ -501,14 +501,24 @@ curl -s -X POST http://localhost:8000/query \
   `count(*)` 无惰性行；`count(col)` 的 `col IS NULL` 行为惰性；
   `sum(col)` 的 `col IS NULL` 或 `col = 0` 行为惰性（删掉零行总和不变，
   十条补位 `0` 全部约简掉）；`min/max(col)` 中非 NULL 且不等于目标极值
-  的行为惰性。只在惰性成员见证中出现的来源行标签移出候选池。
+  的行为惰性。只在惰性成员见证中出现的来源行标签先移出候选池。
+* **标签依赖门（连接场景下复核约简）**：上面的“按成员数值约简”对扫描、
+  过滤和一对一连接严格成立（删一个活跃标签恰好移除一个活跃成员，每个活跃
+  标签的单例删除都已令目标消失）；但连接（尤其自连接）里同一个来源标签可
+  能喂给多个成员——例如来源行 1 同时产出金额 `+5` 与 `-5` 两条连接成员，
+  删行 1 会把二者一起移除（净值变化 0），而一条金额为 `0` 的自连接成员
+  （行 4 自连接）仍然存活，目标 `total=0` 并不消失。此时零值成员的标签
+  不能约简。服务在枚举前对候选池做一次 **标签依赖门**：逐个重算“仅删该
+  活跃标签”的整条计划；只要存在一个不致死的活跃标签，就把候选池放宽回
+  全量成员标签，再做精确枚举。门的每次重算都计入 10 000 次重算预算。
 * **精确枚举（不利用失败剪枝）**：按删除集大小递增枚举；**只有已找到
   解的超集才跳过**（超集必不极小），某个删除集没让目标消失，绝不据此
   跳过它的超集 —— 混合正负求和下，多删一行可能正好把总和改离目标值。
-* **两道搜索预算**：约简后候选池上限 **20 行**（否则整体 2^n 不可行）；
-  单次反事实搜索的整计划重算次数上限 **10 000 次**。任一预算耗尽都返回
-  结构化错误 `422 COUNTERFACTUAL_SEARCH_BUDGET_EXCEEDED`，**不会**以成功
-  响应输出命中集近似或部分方案；该错误同样绑定幂等键，重放逐字节一致。
+* **两道搜索预算**：候选池（约简后，或标签依赖门放宽回的全量池）上限
+  **20 行**（否则整体 2^n 不可行）；单次反事实搜索中标签依赖门与整计划
+  重算合计上限 **10 000 次**。任一预算耗尽都返回结构化错误
+  `422 COUNTERFACTUAL_SEARCH_BUDGET_EXCEEDED`，**不会**以成功响应输出
+  命中集近似或部分方案；该错误同样绑定幂等键，重放逐字节一致。
 
 下面就是上面那条 13 行输入的实际请求与响应（十条 `0` 被约简，三个单例
 删除集按标签顺序返回，重算总和分别为 `0`、`3`、`7`）：
@@ -624,10 +634,167 @@ curl -s -X POST http://localhost:8000/query \
 ```json
 {"error":{"code":"COUNTERFACTUAL_SEARCH_BUDGET_EXCEEDED",
  "message":"The exact counterfactual search for this non-monotone (mixed positive/negative) sum could not finish within the configured budget; no approximate deletion sets are returned. Retry with a smaller target group or split the request.",
- "details":{"active_member_count":21,"dropped_inert_label_count":0,
+ "details":{"active_member_count":21,"dependency_gate_recomputes":0,"dropped_inert_label_count":0,
             "full_pool_size":21,"group_member_count":21,
-            "pool_limit":20,"reduced_pool_size":21}}}
+            "pool_limit":20,"reduced_pool_size":21}}
 ```
+
+### 连接求和的反事实：自连接零值成员不能按金额丢弃
+
+候选约简按“成员数值”判断惰性，这在扫描/一对一连接下是精确的；但同一个
+来源标签可以经连接喂给多条成员。下例中表 `ledger` 自连接并过滤出三条
+成员：来源行 1（金额 0）分别与行 2（金额 `5`）、行 3（金额 `-5`）连接，
+行 4 与自身连接（金额 `0`）；标量 `sum(right.amount) = 0`。
+
+* 删行 2：只剩 `(1,3)=-5` 与 `(4,4)=0`，总和变 `-5`，目标消失；
+* 删行 3：只剩 `(1,2)=5` 与 `(4,4)=0`，总和变 `5`，目标消失；
+* **只删行 1**：`(1,2)` 与 `(1,3)` 同时消失（净值变化 0），`(4,4)=0`
+  仍然存活，总和依旧是 `0` —— 目标 **不** 消失；
+* 同时删 `{行1, 行4}`：所有连接成员都被移除，标量聚合输入为空，
+  返回结构化 `recompute_error: EMPTY_AGGREGATE`，目标消失。
+
+因此极小删除集是 `{ledger[2]}`、`{ledger[3]}` 与双标签方案
+`{ledger[1], ledger[4]}`。标签依赖门重算“仅删 ledger[1]”后发现目标仍
+在，便把零值自连接成员的标签 `ledger[4]` 放回候选池；精确枚举随即找到
+双标签方案。若只按成员金额丢弃零值标签，就会漏报该方案。
+
+```bash
+curl -s -X POST http://localhost:8000/query \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "idempotency_key": "readme-selfjoin-1",
+  "tables": [
+    {"table": "ledger", "primary_key": ["id"],
+     "columns": [
+       {"name": "id", "type": "int"},
+       {"name": "k", "type": "int"},
+       {"name": "amount", "type": "int"}],
+     "rows": [
+       {"id": 1, "k": 1, "amount": 0},
+       {"id": 2, "k": 1, "amount": 5},
+       {"id": 3, "k": 1, "amount": -5},
+       {"id": 4, "k": 2, "amount": 0}
+     ]}
+  ],
+  "plan": {
+    "type": "aggregate",
+    "input": {
+      "type": "filter",
+      "predicate": {"or": [
+        {"and": [
+          {"column": "id", "op": "=", "value": 1},
+          {"column": "right.id", "op": ">=", "value": 2}]},
+        {"column": "id", "op": "=", "value": 4}
+      ]},
+      "input": {
+        "type": "join",
+        "left": {"type": "scan", "table": "ledger"},
+        "right": {"type": "scan", "table": "ledger"},
+        "on": [{"left": "k", "right": "k"}]
+      }
+    },
+    "aggregates": [{"fn": "sum", "column": "right.amount", "as": "total"}]
+  },
+  "explain": {"row": {"total": 0}}
+}'
+```
+
+实际响应（线上传输为单行紧凑 JSON；这里为可读性格式化）：
+
+```json
+{
+  "status": "ok",
+  "symbol_table": [
+    {"symbol": "s1", "source": "ledger[1]"},
+    {"symbol": "s2", "source": "ledger[2]"},
+    {"symbol": "s3", "source": "ledger[3]"},
+    {"symbol": "s4", "source": "ledger[4]"}
+  ],
+  "result": {
+    "columns": ["total"],
+    "row_count": 1,
+    "rows": [
+      {
+        "row": {"total": 0},
+        "witness_count": 2,
+        "minimal_witnesses": [
+          {
+            "labels": ["ledger[1]", "ledger[2]", "ledger[3]"],
+            "symbols": ["s1", "s2", "s3"],
+            "conjunction": "s1 ∧ s2 ∧ s3"
+          },
+          {
+            "labels": ["ledger[4]"],
+            "symbols": ["s4"],
+            "conjunction": "s4"
+          }
+        ],
+        "provenance": {
+          "dnf": "(s1 ∧ s2 ∧ s3) ∨ (s4)",
+          "dnf_structured": [["s1", "s2", "s3"], ["s4"]],
+          "labels_structured": [
+            ["ledger[1]", "ledger[2]", "ledger[3]"],
+            ["ledger[4]"]
+          ]
+        }
+      }
+    ]
+  },
+  "counterfactual": {
+    "target_index": 0,
+    "target": {"total": 0},
+    "target_provenance": {
+      "dnf": "(s1 ∧ s2 ∧ s3) ∨ (s4)",
+      "dnf_structured": [["s1", "s2", "s3"], ["s4"]],
+      "labels_structured": [
+        ["ledger[1]", "ledger[2]", "ledger[3]"],
+        ["ledger[4]"]
+      ]
+    },
+    "minimal_deletion_count": 3,
+    "minimal_deletion_sets": [
+      ["ledger[1]", "ledger[4]"],
+      ["ledger[2]"],
+      ["ledger[3]"]
+    ],
+    "scenarios": [
+      {
+        "delete": ["ledger[1]", "ledger[4]"],
+        "target_present": false,
+        "recompute_error": {
+          "code": "EMPTY_AGGREGATE",
+          "message": "aggregate input is empty: no groups can be formed"
+        }
+      },
+      {
+        "delete": ["ledger[2]"],
+        "target_present": false,
+        "result": {"columns": ["total"], "row_count": 1,
+                   "rows": [{"total": -5}]}
+      },
+      {
+        "delete": ["ledger[3]"],
+        "target_present": false,
+        "result": {"columns": ["total"], "row_count": 1,
+                   "rows": [{"total": 5}]}
+      }
+    ]
+  }
+}
+```
+
+解读：目标 `total=0` 有两条极小见证 —— 三条连接成员中产生 0 的极小非空
+组合 `{(1,2),(1,3)}`（标签 `ledger[1] ∧ ledger[2] ∧ ledger[3]`）与零值
+自连接对 `(4,4)`（标签 `ledger[4]`）。单删 `ledger[1]` 会同时带走 `+5`
+与 `-5` 两条成员，零值自连接对仍在，目标不消失，因此它不是删除集；双标签
+方案 `{ledger[1], ledger[4]}` 清空全部成员后以 `EMPTY_AGGREGATE` 判定
+目标消失。三个方案全部经删除后重算整条计划确认并按包含关系极小。
+
+反过来，金额 `5`、`-5` 加九条 `0` 的 **一对一** 连接（每个来源标签只
+喂一条成员）下，删任一活跃标签都会单独移走 `+5` 或 `-5`，依赖门通过、
+九条零值对照常约简，返回的仍是四个单标签方案
+（`orders[1]`、`orders[2]`、`customers[1]`、`customers[2]`），不会因
+候选池膨胀误报预算耗尽。
 
 ### 幂等重放逐字节一致
 
@@ -661,7 +828,7 @@ cmp a.json b.json && echo "byte-identical"   # byte-identical
 | `EMPTY_AGGREGATE` | 聚合输入为空（无法形成任何组；含标量聚合） |
 | `TYPE_ERROR` | 声明类型不符、跨类型比较/连接、对非数值求 `sum`、对布尔值做有序比较 |
 | `TARGET_NOT_FOUND` | `explain` 的 index 越界或 row 不匹配任何输出 |
-| `COUNTERFACTUAL_SEARCH_BUDGET_EXCEEDED` | 混合正负 `sum` 的精确反事实搜索耗尽预算（约简后候选池超过 20 行，或整计划重算超过 10 000 次；HTTP 422，不返回近似方案） |
+| `COUNTERFACTUAL_SEARCH_BUDGET_EXCEEDED` | 混合正负 `sum` 的精确反事实搜索耗尽预算（约简/放宽后候选池超过 20 行，或标签依赖门与整计划重算合计超过 10 000 次；HTTP 422，不返回近似方案） |
 | `IDEMPOTENCY_KEY_CONFLICT` | 幂等键已绑定到另一个规范化请求（HTTP 409） |
 
 ---
@@ -680,11 +847,15 @@ cmp a.json b.json && echo "byte-identical"   # byte-identical
 * 例外是 **含正负混合值的 `sum`**（非单调求和）：删除不属于任何极小组合的
   行也可能改变总和，且删除更多行可能让目标值重新出现，命中集刻画不再成立。
   此时服务先对目标组做 **候选约简**（`sum` 的零值/NULL 行、`min/max` 的非
-  极值行、`count(col)` 的 NULL 行不可能出现在任何极小删除集中，被移出候选
-  池），再对剩余候选行按删除集大小递增枚举，**按删除后重算的完整目标行**
+  极值行、`count(col)` 的 NULL 行先移出候选池），再过一道 **标签依赖门**：
+  连接（尤其自连接）里同一来源标签可喂给多条成员（如行 1 同时产出 `+5` 与
+  `-5` 两条连接成员），其单例删除未必致死，而一条零值自连接成员可能正是
+  目标存活的原因；只要有活跃标签的单例删除不致死，候选池就放宽回全量成员
+  标签。随后对候选删除集按大小递增枚举，**按删除后重算的完整目标行**
   判定，返回全部按包含关系极小的方案；枚举中只有已找到解的超集才被跳过，
-  未命中的删除集不会剪枝其超集。约简后候选池超过 20 行、或整计划重算超过
-  10 000 次时返回结构化错误 `COUNTERFACTUAL_SEARCH_BUDGET_EXCEEDED`（HTTP
-  422），绝不回退为命中集近似。无论走哪条路径，每个删除场景都会 **重算整条
-  计划** 并显式给出 `target_present`，以重算结果为准；删除后聚合输入为空时，
-  场景返回结构化的 `recompute_error`（如 `EMPTY_AGGREGATE`）。
+  未命中的删除集不剪枝其超集。候选池（约简后或放宽后）超过 20 行、或标签
+  依赖门与整计划重算合计超过 10 000 次时返回结构化错误
+  `COUNTERFACTUAL_SEARCH_BUDGET_EXCEEDED`（HTTP 422），绝不回退为命中集
+  近似。无论走哪条路径，每个删除场景都会 **重算整条计划** 并显式给出
+  `target_present`，以重算结果为准；删除后聚合输入为空时，场景返回结构化
+  的 `recompute_error`（如 `EMPTY_AGGREGATE`）。

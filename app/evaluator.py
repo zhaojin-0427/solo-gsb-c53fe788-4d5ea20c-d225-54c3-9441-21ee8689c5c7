@@ -46,15 +46,23 @@ class RecomputePool:
 
     Attributes:
       full:    every source label in the target group's member witnesses;
-      reduced: labels whose deletion can actually belong to an
-               inclusion-minimal counterfactual (see candidate reduction in
-               ``mixed_sign_sum_pool``);
+      active_labels: labels appearing in at least one witness of an *active*
+               member (a member whose deletion can change one of the target
+               aggregate values). Labels in ``full - active_labels`` support
+               only inert members (e.g. zero-valued join pairs) and are the
+               candidates for reduction;
+      reduced: labels the exact search actually enumerates. It starts equal
+               to ``active_labels``; the dependency gate
+               (``provenance.refine_reduced_pool``) widens it back to ``full``
+               when the inert labels may participate in a minimal deletion
+               set (as with a self-join, where one source label feeds several
+               members whose value changes cancel out);
       group_member_count: number of input rows in the target group;
       active_member_count: number of those that can change at least one
                aggregate value of the target output.
     """
 
-    __slots__ = ("full", "reduced", "group_member_count", "active_member_count")
+    __slots__ = ("full", "reduced", "active_labels", "group_member_count", "active_member_count")
 
     def __init__(
         self,
@@ -62,9 +70,11 @@ class RecomputePool:
         reduced: set[Label],
         group_member_count: int,
         active_member_count: int,
+        active_labels: set[Label] | None = None,
     ):
         self.full = full
         self.reduced = reduced
+        self.active_labels = active_labels if active_labels is not None else set(reduced)
         self.group_member_count = group_member_count
         self.active_member_count = active_member_count
 
@@ -626,12 +636,20 @@ class Evaluator:
           extremum — removing it cannot move the extremum.
 
         A member is *active* when it is non-inert for at least one aggregate.
-        The reduced pool is the union of the active members' witness labels
-        (any label supporting only inert members is dropped). Every minimal
-        deletion set of the full pool is contained in the reduced pool:
-        deleting inert members alone leaves every target aggregate value
-        untouched and the group key fixed, and an inert member added to a
-        killing set is removable without restoring the target row.
+        The provisional reduced pool is the union of the active members'
+        witness labels (any label supporting only inert members is dropped
+        for now). That provisional reduction is exact when every group member
+        depends on its own source labels — scans, filters, and one-to-one
+        joins: deleting one active label then removes exactly one active
+        member, so every active-label singleton already changes the target.
+        It is NOT exact in general under joins, where one source label can
+        feed several members: deleting it may remove a +5 member and a -5
+        member together (net zero) while a zero-valued self-join member
+        survives, leaving the target in place — the inert member's labels
+        then belong to a minimal deletion set after all. The caller
+        therefore validates the reduction with the label-dependency gate in
+        ``provenance.refine_reduced_pool`` (recomputing once per active
+        label) and widens the pool back to ``full`` when the gate fails.
         """
         data = tuple(target_data)
         while True:
@@ -717,17 +735,26 @@ class Evaluator:
             if active[i]:
                 reduced_pool.update(member_labels)
 
-        # Defensive: an empty reduced pool would mean no singleton pool at
-        # all, but a mixed-sign sum guarantees non-zero members exist; leave
-        # the exact-path decision to the caller rather than searching nothing.
+        # Defensive: an empty active pool would mean no active label at all,
+        # but a mixed-sign sum guarantees non-zero members exist; leave the
+        # exact-path decision to the caller rather than searching nothing.
         if not reduced_pool:
             return None
 
+        # The reduced pool initially holds only the active members' labels.
+        # Whether labels supporting inert members alone (e.g. a zero-valued
+        # self-join pair) may be dropped is decided afterwards by the label
+        # dependency gate in provenance.refine_reduced_pool: with joins one
+        # source label can feed several members whose value changes cancel
+        # (e.g. the +5 and -5 pairs sharing source row 1), so an inert member
+        # can be exactly what keeps the zero target alive after its active
+        # partners are removed.
         return RecomputePool(
             full=full_pool,
             reduced=reduced_pool,
             group_member_count=len(members),
             active_member_count=sum(active),
+            active_labels=set(reduced_pool),
         )
 
     def _agg_spec(self, node: dict):
